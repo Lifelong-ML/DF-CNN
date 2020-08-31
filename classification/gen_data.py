@@ -1,14 +1,17 @@
 import sys
 import os, pickle
-from random import shuffle
+from random import shuffle, randint
+import gzip, csv
+#from types import ListType
 
+from scipy.io import savemat
 import numpy as np
 from tensorflow.examples.tutorials.mnist import input_data
 
-import skimage
+import skimage.transform
 import matplotlib.image as mpimg
 
-#### shuffle two lists while maintaining pairs between them
+
 def shuffle_data_x_and_y(data_x, data_y):
     num_x, num_y = data_x.shape[0], data_y.shape[0]
     assert (num_x == num_y), "Given two data have different number of data points"
@@ -18,27 +21,67 @@ def shuffle_data_x_and_y(data_x, data_y):
     new_data_x, new_data_y = np.array(data_x[indices]), np.array(data_y[indices])
     return new_data_x, new_data_y
 
+#### function to split data into each categories (gather data of same digit)
+def data_class_split(raw_data_x_and_y, num_class):
+    raw_x, raw_y = raw_data_x_and_y
+    img_bins = [[] for _ in range(num_class)]
+    for cnt in range(raw_x.shape[0]):
+        img_bins[int(raw_y[cnt])].append(raw_x[cnt])
+    return img_bins
+
+#### function to split train data into train and validation set
+def data_split_for_validation_data(categorized_train_data, num_train_valid=None, ratio_of_valid_to_train=None):
+    num_class = len(categorized_train_data)
+    if num_train_valid is not None:
+        _num_train_data, _num_valid_data = num_train_valid
+        num_train_datas, num_valid_datas = [_num_train_data for _ in range(num_class)], [_num_valid_data for _ in range(num_class)]
+    elif ratio_of_valid_to_train is not None:
+        num_train_datas, num_valid_datas = [], []
+        for images_of_each_class in categorized_train_data:
+            if type(images_of_each_class) == np.ndarray:
+                num_data = images_of_each_class.shape[0]
+            elif type(images_of_each_class) == list:
+                num_data = len(images_of_each_class)
+            num_valid_datas.append(int(num_data*ratio_of_valid_to_train/(1.0+ratio_of_valid_to_train)))
+            num_train_datas.append(min(num_data-num_valid_datas[-1], int(num_data/(1.0+ratio_of_valid_to_train))))
+    else:
+        print("Must provide either number of train/valid data or ratio of valid to train!")
+        raise ValueError
+
+    train_img, valid_img = [[] for _ in range(num_class)], [[] for _ in range(num_class)]
+    for class_cnt, (images_of_each_class, num_train_data, num_valid_data) in enumerate(zip(categorized_train_data, num_train_datas, num_valid_datas)):
+        if type(images_of_each_class) == np.ndarray:
+            num_data = images_of_each_class.shape[0]
+        elif type(images_of_each_class) == list:
+            num_data = len(images_of_each_class)
+        indices = list(range(num_data))
+        shuffle(indices)
+        for data_cnt in range(num_data):
+            if data_cnt < num_valid_data:
+                valid_img[class_cnt].append(images_of_each_class[indices[data_cnt]])
+            elif data_cnt < num_valid_data + num_train_data:
+                train_img[class_cnt].append(images_of_each_class[indices[data_cnt]])
+            else:
+                break
+    return (train_img, valid_img)
+
 
 # MNIST data (label : number of train/number of valid/number of test)
+# 0 : 5444/479/980, 1 : 6179/563/1135, 2 : 5470/488/1032, 3 : 5638/493/1010
+# 4 : 5307/535/982, 5 : 4987/434/892,  6 : 5417/501/958,  7 : 5715/550/1028
+# 8 : 5389/462/974, 9 : 5454/495/1009
+
 #### function to split data into each categories (gather data of same digit)
 def mnist_data_class_split(mnist_class):
-    train_img, valid_img, test_img = [[] for _ in range(10)], [[] for _ in range(10)], [[] for _ in range(10)]
-    for cnt in range(mnist_class.train.images.shape[0]):
-        class_inst, x = mnist_class.train.labels[cnt], mnist_class.train.images[cnt, :]
-        train_img[class_inst].append(x)
-
-    for cnt in range(mnist_class.validation.images.shape[0]):
-        class_inst, x = mnist_class.validation.labels[cnt], mnist_class.validation.images[cnt, :]
-        valid_img[class_inst].append(x)
-
-    for cnt in range(mnist_class.test.images.shape[0]):
-        class_inst, x = mnist_class.test.labels[cnt], mnist_class.test.images[cnt, :]
-        test_img[class_inst].append(x)
+    train_img = data_class_split((mnist_class.train.images, mnist_class.train.labels), 10)
+    valid_img = data_class_split((mnist_class.validation.images, mnist_class.validation.labels), 10)
+    test_img = data_class_split((mnist_class.test.images, mnist_class.test.labels), 10)
     return (train_img, valid_img, test_img)
 
 #### function to shuffle and randomly select some portion of given data
 def shuffle_select_some_data(list_of_data, ratio_to_choose):
-    #### assume list_of_data = [[class0_img0, class0_img1, ...], [class1_img0, class1_img1, ...], [], ..., []]
+    #### assume list_of_data = [[ndarray, ndarray, ...], [ndarray, ndarray, ...], [], ..., []]
+    ####        with number of data points for ndarray, and number of classes for list
     if ratio_to_choose > 1.0:
         ratio_to_choose = float(ratio_to_choose)/100.0
 
@@ -52,7 +95,7 @@ def shuffle_select_some_data(list_of_data, ratio_to_choose):
         selected_list_of_data.append(list(data_copy[0:num_data_to_choose]))
     return selected_list_of_data
 
-#### function to concatenate data of image classes which are not specified for exclusion
+#### function to concatenate data other than that for the specified class
 def concat_data_of_classes(given_data, class_not_to_add):
     data_to_return = []
     for cnt in range(len(given_data)):
@@ -63,6 +106,8 @@ def concat_data_of_classes(given_data, class_not_to_add):
 
 #### function to make dataset (either train/valid/test) for binary classification
 def mnist_data_gen_binary_classification(img_for_true, img_for_false, dataset_size):
+    #### dataset has at least 'min_num_from_each' numbers of instances from each class
+    #### thus, the number of data for a class is [min_num_from_each, min_num_from_each + num_variable_class]
     half_of_dataset_size = dataset_size // 2
     if len(img_for_true) < half_of_dataset_size and len(img_for_false) < half_of_dataset_size:
         return (None, None)
@@ -98,10 +143,11 @@ def mnist_data_print_info(train_data, valid_data, test_data, no_group=False, pri
 
         num_train, num_valid, num_test = [train_data[x][0].shape[0] for x in range(num_task)], [valid_data[x][0].shape[0] for x in range(num_task)], [test_data[x][0].shape[0] for x in range(num_task)]
         x_dim, y_dim = train_data[0][0].shape[1], 0
-        y_depth = np.amax(train_data[0][1])+1
+        y_depth = [int(np.amax(x[1])+1) for x in train_data]
         if print_info:
             print("Tasks : %d\nTrain data : %d, Validation data : %d, Test data : %d" %(num_task, num_train, num_valid, num_test))
-            print("Input dim : %d, Output dim : %d, Maximum label : %d\n" %(x_dim, y_dim, y_depth))
+            print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+            print("Maximum label : ", y_depth, "\n")
         return (num_task, num_train, num_valid, num_test, x_dim, y_dim, y_depth)
     else:
         assert (len(train_data) == len(valid_data)), "Different number of groups in train/validation data"
@@ -116,11 +162,12 @@ def mnist_data_print_info(train_data, valid_data, test_data, no_group=False, pri
 
         num_train, num_valid, num_test = [train_data[0][x][0].shape[0] for x in range(num_task)], [valid_data[0][x][0].shape[0] for x in range(num_task)], [test_data[x][0].shape[0] for x in range(num_task)]
         x_dim, y_dim = train_data[0][0][0].shape[1], 0
-        y_depth = max([np.amax(train_data[0][x][1]) for x in range(num_task)])+1
+        y_depth = [int(np.amax(x[1])+1) for x in train_data[0]]
         if print_info:
             print("Tasks : %d, Groups of training/valid : %d\n" %(num_task, num_group))
             print("Train data : ", num_train, ", Validation data : ", num_valid, ", Test data : ", num_test)
-            print("Input dim : %d, Output dim : %d, Maximum label : %d\n" %(x_dim, y_dim, y_depth))
+            print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+            print("Maximum label : ", y_depth, "\n")
         return (num_task, num_group, num_train, num_valid, num_test, x_dim, y_dim, y_depth)
 
 
@@ -251,34 +298,6 @@ def read_cifar10_data(data_path):
     return (proc_train_x, proc_train_y, proc_test_x, proc_test_y)
 
 
-#### function to split data into each categories (gather data of same digit)
-def cifar_data_class_split(cifar_data, num_class):
-    raw_train_x, raw_train_y, raw_test_x, raw_test_y = cifar_data
-    train_img, test_img = [[] for _ in range(num_class)], [[] for _ in range(num_class)]
-    for cnt in range(len(raw_train_x)):
-        train_img[int(raw_train_y[cnt])].append(raw_train_x[cnt])
-
-    for cnt in range(len(raw_test_x)):
-        test_img[int(raw_test_y[cnt])].append(raw_test_x[cnt])
-    return (train_img, test_img)
-
-
-#### function to split train data into train and validation data
-def cifar_split_for_validation_data(categorized_cifar_train_data, train_valid_ratio):
-    num_class = len(categorized_cifar_train_data)
-    train_img, valid_img = [[] for _ in range(num_class)], [[] for _ in range(num_class)]
-    for class_cnt in range(num_class):
-        num_data = len(categorized_cifar_train_data[class_cnt])
-        indices, num_valid_data = list(range(num_data)), int(num_data*train_valid_ratio/(1.0+train_valid_ratio))
-        shuffle(indices)
-        for data_cnt in range(num_data):
-            if data_cnt < num_valid_data:
-                valid_img[class_cnt].append(categorized_cifar_train_data[class_cnt][indices[data_cnt]])
-            else:
-                train_img[class_cnt].append(categorized_cifar_train_data[class_cnt][indices[data_cnt]])
-    return (train_img, valid_img)
-
-
 #### function to normalize cifar data
 def cifar_data_standardization(raw_data):
     if len(raw_data.shape)<2:
@@ -300,6 +319,8 @@ def cifar_data_standardization(raw_data):
 
 #### function to make dataset (either train/valid/test) for binary classification
 def cifar_data_gen_binary_classification(img_for_true, img_for_false, dataset_size):
+    #### dataset has at least 'min_num_from_each' numbers of instances from each class
+    #### thus, the number of data for a class is [min_num_from_each, min_num_from_each + num_variable_class]
     if dataset_size < 1:
         dataset_size = len(img_for_true) + len(img_for_false)
 
@@ -329,6 +350,8 @@ def cifar_data_gen_binary_classification(img_for_true, img_for_false, dataset_si
 
 #### function to make dataset (either train/valid/test) for multi-class classification
 def cifar_data_gen_multiclass_classification(imgs, num_class, dataset_size):
+    #### dataset has at least 'min_num_from_each' numbers of instances from each class
+    #### thus, the number of data for a class is [min_num_from_each, min_num_from_each + num_variable_class]
     if dataset_size < 1:
         dataset_size = sum([len(x) for x in imgs])
 
@@ -355,40 +378,55 @@ def cifar_data_gen_multiclass_classification(imgs, num_class, dataset_size):
 
 
 #### function to print information of data file (number of parameters, dimension, etc.)
-def cifar_data_print_info(train_data, valid_data, test_data, no_group=False, print_info=True):
+def cifar_data_print_info(train_data, valid_data, test_data, no_group=False, print_info=True, grouped_test=False):
     if no_group:
         num_task = len(train_data)
 
         num_train, num_valid, num_test = [train_data[x][0].shape[0] for x in range(num_task)], [valid_data[x][0].shape[0] for x in range(num_task)], [test_data[x][0].shape[0] for x in range(num_task)]
         x_dim, y_dim = train_data[0][0].shape[1], 0
-        y_depth = np.amax(train_data[0][1])+1
+        y_depth = [int(np.amax(x[1])+1) for x in train_data]
         if print_info:
             print("Tasks : %d\nTrain data : %d, Validation data : %d, Test data : %d" %(num_task, num_train, num_valid, num_test))
-            print("Input dim : %d, Output dim : %d, Maximum label : %d\n" %(x_dim, y_dim, y_depth))
+            print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+            print("Maximum label : ", y_depth, "\n")
         return (num_task, num_train, num_valid, num_test, x_dim, y_dim, y_depth)
     else:
-        assert (len(train_data) == len(valid_data)), "Different number of groups in train/validation data"
+        if grouped_test:
+            assert (len(train_data) == len(valid_data) and len(valid_data) == len(test_data)), "Different number of groups in train/validation data"
+            assert (len(train_data[0])==len(valid_data[0]) and len(train_data[0])==len(test_data[0])), "Different number of tasks in train/validation/test data"
+        else:
+            assert (len(train_data) == len(valid_data)), "Different number of groups in train/validation data"
+            assert (len(train_data[0])==len(valid_data[0]) and len(train_data[0])==len(test_data)), "Different number of tasks in train/validation/test data"
         num_group = len(train_data)
 
         bool_num_task = [(len(train_data[0]) == len(train_data[x])) for x in range(1, num_group)]
         assert all(bool_num_task), "Different number of tasks in some of groups in train data"
         bool_num_task = [(len(valid_data[0]) == len(valid_data[x])) for x in range(1, num_group)]
         assert all(bool_num_task), "Different number of tasks in some of groups in validation data"
-        assert (len(train_data[0])==len(valid_data[0]) and len(train_data[0])==len(test_data)), "Different number of tasks in train/validation/test data"
+        if grouped_test:
+            bool_num_task = [(len(test_data[0]) == len(test_data[x])) for x in range(1, num_group)]
+            assert all(bool_num_task), "Different number of tasks in some of groups in test data"
         num_task = len(train_data[0])
 
-        num_train, num_valid, num_test = [train_data[0][x][0].shape[0] for x in range(num_task)], [valid_data[0][x][0].shape[0] for x in range(num_task)], [test_data[x][0].shape[0] for x in range(num_task)]
+        num_train, num_valid = [train_data[0][x][0].shape[0] for x in range(num_task)], [valid_data[0][x][0].shape[0] for x in range(num_task)]
+        if grouped_test:
+            num_test = [test_data[0][x][0].shape[0] for x in range(num_task)]
+        else:
+            num_test = [test_data[x][0].shape[0] for x in range(num_task)]
+
         x_dim, y_dim = train_data[0][0][0].shape[1], 0
-        y_depth = max([np.amax(train_data[0][x][1]) for x in range(num_task)])+1
+        y_depth = [int(np.amax(x[1])+1) for x in train_data[0]]
         if print_info:
             print("Tasks : %d, Groups of training/valid : %d\n" %(num_task, num_group))
             print("Train data : ", num_train, ", Validation data : ", num_valid, ", Test data : ", num_test)
-            print("Input dim : %d, Output dim : %d, Maximum label : %d\n" %(x_dim, y_dim, y_depth))
+            print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+            print("Maximum label : ", y_depth, "\n")
         return (num_task, num_group, num_train, num_valid, num_test, x_dim, y_dim, y_depth)
 
 
 #### process cifar10 data to generate pickle file with data in right format for DNN models
-def cifar10_data(data_file_name, num_train_max, num_valid_max, num_test_max, num_train_group, num_tasks, train_valid_ratio=0.2, multiclass=False, data_percent=100):
+#### train/test data : 5000/1000 per class
+def cifar10_data(data_file_name, num_train_max, num_valid_max, num_test_max, num_train_group, num_tasks, train_valid_ratio=0.2, multiclass=False, save_as_mat=False, data_percent=100):
     curr_path = os.getcwd()
     if not ('Data' in os.listdir(curr_path)):
         os.mkdir('./Data')
@@ -406,8 +444,9 @@ def cifar10_data(data_file_name, num_train_max, num_valid_max, num_test_max, num
         cifar10_trainx, cifar10_trainy, cifar10_testx, cifar10_testy = read_cifar10_data(raw_data_path)
 
         #### split data into sets for each label
-        categorized_train_x_tmp, categorized_test_x = cifar_data_class_split([cifar10_trainx, cifar10_trainy, cifar10_testx, cifar10_testy], 10)
-        categorized_train_x, categorized_valid_x = cifar_split_for_validation_data(categorized_train_x_tmp, train_valid_ratio)
+        categorized_train_x_tmp = data_class_split([cifar10_trainx, cifar10_trainy], 10)
+        categorized_test_x = data_class_split([cifar10_testx, cifar10_testy], 10)
+        categorized_train_x, categorized_valid_x = data_split_for_validation_data(categorized_train_x_tmp, ratio_of_valid_to_train=train_valid_ratio)
 
         if multiclass:
             #### make data into multi-class
@@ -486,6 +525,10 @@ def cifar10_data(data_file_name, num_train_max, num_valid_max, num_test_max, num
                     test_data.append( ( np.array(test_x_tmp), np.array(test_y_tmp) ) )
 
         #### save data
+        if save_as_mat:
+            data_to_save_in_mat = _data_save_to_mat(train_data, validation_data, test_data, num_train_group, num_tasks)
+            savemat('./Data/'+data_file_name[0:-4]+'.mat', data_to_save_in_mat)
+
         with open('./Data/' + data_file_name, 'wb') as fobj:
             pickle.dump([train_data, validation_data, test_data], fobj)
             print('Successfully generate/save data')
@@ -582,7 +625,7 @@ def read_cifar100_data(data_path):
 
 #### process cifar100 data to generate pickle file with data in right format for DNN models
 #### train/test data : 500/100 per class
-def cifar100_data(data_file_name, num_train_max, num_valid_max, num_test_max, num_train_group, num_tasks, train_valid_ratio=0.2, multiclass=False):
+def cifar100_data(data_file_name, num_train_max, num_valid_max, num_test_max, num_train_group, num_tasks, train_valid_ratio=0.2, multiclass=False, save_as_mat=False):
     curr_path = os.getcwd()
     if not ('Data' in os.listdir(curr_path)):
         os.mkdir('./Data')
@@ -600,8 +643,9 @@ def cifar100_data(data_file_name, num_train_max, num_valid_max, num_test_max, nu
         cifar100_trainx, cifar100_trainy, cifar100_testx, cifar100_testy = read_cifar100_data(raw_data_path)
 
         #### split data into sets for each label
-        categorized_train_x_tmp, categorized_test_x = cifar_data_class_split([cifar100_trainx, cifar100_trainy, cifar100_testx, cifar100_testy], 100)
-        categorized_train_x, categorized_valid_x = cifar_split_for_validation_data(categorized_train_x_tmp, train_valid_ratio)
+        categorized_train_x_tmp = data_class_split([cifar100_trainx, cifar100_trainy], 100)
+        categorized_test_x = data_class_split([cifar100_testx, cifar100_testy], 100)
+        categorized_train_x, categorized_valid_x = data_split_for_validation_data(categorized_train_x_tmp, ratio_of_valid_to_train=train_valid_ratio)
 
         if multiclass:
             #### make data into multi-class
@@ -662,11 +706,14 @@ def cifar100_data(data_file_name, num_train_max, num_valid_max, num_test_max, nu
                 test_data.append( ( np.array(test_x_tmp), np.array(test_y_tmp) ) )
 
         #### save data
+        if save_as_mat:
+            data_to_save_in_mat = _data_save_to_mat(train_data, validation_data, test_data, num_train_group, num_tasks)
+            savemat('./Data/'+data_file_name[0:-4]+'.mat', data_to_save_in_mat)
+
         with open('./Data/' + data_file_name, 'wb') as fobj:
             pickle.dump([train_data, validation_data, test_data], fobj)
             print('Successfully generate/save data')
     return (train_data, validation_data, test_data)
-
 
 
 ################################### Office-Home Data
@@ -733,7 +780,7 @@ def read_officehome_all_images(super_class_list, img_size):
     return raw_images
 
 
-def officehome_data(data_file_name, num_train_ratio, num_valid_ratio, num_test_ratio, num_train_group, img_size):
+def officehome_data(data_file_name, num_train_ratio, num_valid_ratio, num_test_ratio, num_train_group, img_size, save_as_mat=False):
     assert (num_train_ratio + num_valid_ratio + num_test_ratio <= 1.0), "Sum of the given ratio of data should be less than or equal to 1"
 
     curr_path = os.getcwd()
@@ -793,6 +840,10 @@ def officehome_data(data_file_name, num_train_ratio, num_valid_ratio, num_test_r
             num_tasks = len(train_data_tmp)
 
         #### save data
+        if save_as_mat:
+            data_to_save_in_mat = _data_save_to_mat(train_data, validation_data, test_data, num_train_group, num_tasks)
+            savemat('./Data/'+data_file_name[0:-4]+'.mat', data_to_save_in_mat)
+
         with open('./Data/' + data_file_name, 'wb') as fobj:
             pickle.dump([train_data, validation_data, test_data], fobj)
             print('Successfully generate/save data')
@@ -804,10 +855,11 @@ def officehome_data_print_info(train_data, valid_data, test_data, no_group=False
 
         num_train, num_valid, num_test = [train_data[x][0].shape[0] for x in range(num_task)], [valid_data[x][0].shape[0] for x in range(num_task)], [test_data[x][0].shape[0] for x in range(num_task)]
         x_dim, y_dim = train_data[0][0].shape[1], 0
-        y_depth = int(np.amax(train_data[0][1])+1)
+        y_depth = [int(np.amax(x[1])+1) for x in train_data]
         if print_info:
             print("Tasks : %d\nTrain data : %d, Validation data : %d, Test data : %d" %(num_task, num_train, num_valid, num_test))
-            print("Input dim : %d, Output dim : %d, Maximum label : %d\n" %(x_dim, y_dim, y_depth))
+            print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+            print("Maximum label : ", y_depth, "\n")
         return (num_task, num_train, num_valid, num_test, x_dim, y_dim, y_depth)
     else:
         assert (len(train_data) == len(valid_data) and len(train_data) == len(test_data)), "Different number of groups in train/validation data"
@@ -822,17 +874,440 @@ def officehome_data_print_info(train_data, valid_data, test_data, no_group=False
 
         num_train, num_valid, num_test = [train_data[0][x][0].shape[0] for x in range(num_task)], [valid_data[0][x][0].shape[0] for x in range(num_task)], [test_data[0][x][0].shape[0] for x in range(num_task)]
         x_dim, y_dim = train_data[0][0][0].shape[1], 0
-        y_depth = max([int(np.amax(train_data[0][x][1])) for x in range(num_task)])+1
+        y_depth = [int(np.amax(x[1])+1) for x in train_data[0]]
         if print_info:
             print("Tasks : %d, Groups of training/valid : %d\n" %(num_task, num_group))
             print("Train data : ", num_train, ", Validation data : ", num_valid, ", Test data : ", num_test)
-            print("Input dim : %d, Output dim : %d, Maximum label : %d\n" %(x_dim, y_dim, y_depth))
+            print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+            print("Maximum label : ", y_depth, "\n")
         return (num_task, num_group, num_train, num_valid, num_test, x_dim, y_dim, y_depth)
+
+
+################################### STL-10 Data
+def each_experiment_info_reader(task_file_name, file_path):
+    if not (task_file_name in os.listdir(file_path)):
+        raise ValueError("Given name of file doesn't exist in the path!")
+    experiment_info = []
+    with open(file_path+'/'+task_file_name, newline='') as csvfile:
+        datareader = csv.reader(csvfile, delimiter=',')
+        for row in datareader:
+            if len(row) > 0:
+                if 'Task' in row[0]:
+                    if ('task_info' in globals() or 'task_info' in locals()):
+                        task_info['TrainIndices'] = np.array(task_info_train_indices_tmp)
+                        task_info['ValidationIndices'] = np.array(task_info_valid_indices_tmp)
+                        experiment_info.append(task_info)
+                        del task_info, task_info_train_indices_tmp, task_info_valid_indices_tmp
+                    task_info = {}
+                    task_info['Task'] = int(row[1])
+                    mode=0
+                elif 'Classes' in row[0]:
+                    task_info['Classes'] = [int(a) for a in row[1:]]
+                    mode=0
+                elif 'Train' in row[0]:
+                    task_info_train_indices_tmp, mode = [], 1
+                elif 'Valid' in row[0]:
+                    task_info_valid_indices_tmp, mode = [], 2
+                elif 'Noise' in row[0]:
+                    ## Mean and variance of gaussian noise
+                    task_info['Noise'] = [float(a) for a in row[1:]]
+                elif 'ChannelSwap' in row[0]:
+                    ## Swap input channels for varying input-level task-similarity (only for dataset with channels>1)
+                    task_info['ChannelSwap'] = [int(a) for a in row[1:]]
+                else:
+                    assert (len(row)>1), "Class-index pair is in wrong format!"
+                    assert (int(row[0]) in task_info['Classes']), "Wrong image class"
+                    if mode == 1:
+                        task_info_train_indices_tmp.append([int(row[0]), int(row[1])])
+                    elif mode == 2:
+                        task_info_valid_indices_tmp.append([int(row[0]), int(row[1])])
+        if ('task_info' in globals() or 'task_info' in locals()):
+            if ('task_info_train_indices_tmp' in globals() or 'task_info_train_indices_tmp' in locals()) and ('task_info_valid_indices_tmp' in globals() or 'task_info_valid_indices_tmp' in locals()):
+                if len(task_info_train_indices_tmp) > 0 and len(task_info_valid_indices_tmp) > 0:
+                    task_info['TrainIndices'] = np.array(task_info_train_indices_tmp)
+                    task_info['ValidationIndices'] = np.array(task_info_valid_indices_tmp)
+                    experiment_info.append(task_info)
+    return experiment_info
+
+def experiment_info_reader(exp_file_name, file_path, num_seeds):
+    experiments_design = []
+    for exp_cnt in range(num_seeds):
+        actual_file_name = exp_file_name+'_s'+str(exp_cnt)+'.csv'
+        if not (actual_file_name in os.listdir(file_path)):
+            raise ValueError("Given name of file doesn't exist in the path!")
+        experiment_info = each_experiment_info_reader(actual_file_name, file_path)
+        experiments_design.append(experiment_info)
+    return experiments_design
+
+#### write experiment design into csv file
+def experiment_info_writer(exp_file_name, file_path, experiments_design):
+    for exp_cnt, (experiment_info) in enumerate(experiments_design):
+        actual_file_name = exp_file_name+'_s'+str(exp_cnt)+'.csv'
+        if (actual_file_name in os.listdir(file_path)):
+            print("\n\nExperiment design with same name already exists!!")
+            decision = input("\tDo overwrite?\t")
+            if not (decision.lower() == 'y' or decision.lower() == 'yes'):
+                raise ValueError("Given name of file cannot be created in the path!")
+
+        with open(file_path+'/'+actual_file_name, 'w', newline='') as csvfile:
+            datawriter = csv.writer(csvfile, delimiter=',')
+            for task_info in experiment_info:
+                datawriter.writerow(['Task', task_info['Task']])
+                datawriter.writerow(['Classes']+task_info['Classes'])
+                if 'Noise' in task_info.keys():
+                    ## Mean and variance of gaussian noise
+                    datawriter.writerow(['Noise']+task_info['Noise'])
+                if 'ChannelSwap' in task_info.keys():
+                    ## Swap input channels for varying input-level task-similarity (only for dataset with channels>1)
+                    datawriter.writerow(['ChannelSwap']+task_info['ChannelSwap'])
+                datawriter.writerow(['TrainIndices'])
+                for data_cnt in range(task_info['TrainIndices'].shape[0]):
+                    datawriter.writerow([task_info['TrainIndices'][data_cnt, 0], task_info['TrainIndices'][data_cnt, 1]])
+                datawriter.writerow(['ValidationIndices'])
+                for data_cnt in range(task_info['ValidationIndices'].shape[0]):
+                    datawriter.writerow([task_info['ValidationIndices'][data_cnt, 0], task_info['ValidationIndices'][data_cnt, 1]])
+
+
+#### make pairs of classes for tasks and lists of data indices for training and validation set
+def experiment_designer(data_percent, num_tasks, num_seeds, valid_data_ratio_to_whole, num_data_per_class, num_classes_per_task, allowNoise=False, allowChannelSwap=False):
+    experiments_design = []
+    num_usable_data_per_class, num_classes = [int(a*data_percent) for a in num_data_per_class], len(num_data_per_class)
+    classes_in_tasks, task_ids = [], []
+    noises_in_tasks, channel_swap_in_tasks = [], []
+    for task_cnt in range(num_tasks):
+        classes_for_this_task = []
+        while len(classes_for_this_task) < num_classes_per_task:
+            a = randint(0, num_classes-1)
+            if len(classes_for_this_task) < 1:
+                classes_for_this_task.append(a)
+            elif not any([b == a for b in classes_for_this_task]):
+                classes_for_this_task.append(a)
+
+            if len(classes_for_this_task) == num_classes_per_task:
+                classes_copy = list(classes_for_this_task)
+                classes_copy.sort()
+                task_id = sum([a*(10**i) for i, (a) in enumerate(classes_copy)])
+                if task_id in task_ids:
+                    classes_for_this_task = []
+                else:
+                    classes_in_tasks.append(classes_for_this_task)
+                    task_ids.append(task_id)
+                    if allowNoise:
+                        mean, std = np.random.randint(-2, 2), np.random.randint(0, 2)
+                        if mean == 0 and std == 0:
+                            noises_in_tasks.append(None)
+                        else:
+                            noises_in_tasks.append([0.025*mean, 0.025*std])
+                    else:
+                        noises_in_tasks.append(None)
+
+                    if allowChannelSwap:
+                        new_channel_list = [0, 1, 2]
+                        shuffle(new_channel_list)
+                        if all([tmp_a == tmp_b for (tmp_a, tmp_b) in zip(new_channel_list, [0, 1, 2])]):
+                            channel_swap_in_tasks.append(None)
+                        else:
+                            channel_swap_in_tasks.append(new_channel_list)
+                    else:
+                        channel_swap_in_tasks.append(None)
+
+    for seed_cnt in range(num_seeds):
+        experiment_info = []
+        for task_cnt, (classes_in_this_task, noise_in_this_task, channel_swap_in_this_task) in enumerate(zip(classes_in_tasks, noises_in_tasks, channel_swap_in_tasks)):
+            task_info, temp_train_indices, temp_valid_indices = {}, [], []
+            task_info['Task'] = task_cnt
+            task_info['Classes'] = classes_in_this_task
+            if noise_in_this_task is not None:
+                task_info['Noise'] = list(noise_in_this_task)
+            if channel_swap_in_this_task is not None:
+                task_info['ChannelSwap'] = list(channel_swap_in_this_task)
+
+            for spec_class in classes_in_this_task:
+                data_indices = list(range(num_data_per_class[spec_class]))
+                shuffle(data_indices)
+                for index_cnt in range(num_usable_data_per_class[spec_class]):
+                    if index_cnt < valid_data_ratio_to_whole*num_usable_data_per_class[spec_class]:
+                        temp_valid_indices.append([spec_class, data_indices[index_cnt]])
+                    else:
+                        temp_train_indices.append([spec_class, data_indices[index_cnt]])
+            task_info['TrainIndices'] = np.array(temp_train_indices)
+            task_info['ValidationIndices'] = np.array(temp_valid_indices)
+            experiment_info.append(task_info)
+        experiments_design.append(experiment_info)
+    return experiments_design
+
+
+def print_experiment_design(exp_design, data_type, print_info=True):
+    if 'fashion' in data_type.lower():
+        x_dim, y_dim = 28*28, 0
+    elif 'stl' in data_type.lower() or 'stl10' in data_type.lower():
+        x_dim, y_dim = 96*96*3, 0
+    else:
+        x_dim, y_dim = None, None
+
+    if type(exp_design) == list:
+        if type(exp_design[0]) == dict:
+            # exp design containing a series of sub-tasks for one random seed
+            num_task = len(exp_design)
+            num_train, num_valid = [exp_design[x]['TrainIndices'].shape[0] for x in range(num_task)], [exp_design[x]['ValidationIndices'].shape[0] for x in range(num_task)]
+            y_depth = [len(exp_design[x]['Classes']) for x in range(num_task)]
+
+            if print_info:
+                print("Train data : ", num_train, ", Validation data : ", num_valid)
+                print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+                print("Maximum label : ", y_depth, "\n")
+            return (num_task, num_train, num_valid, x_dim, y_dim, y_depth)
+        elif type(exp_design[0]) == list:
+            # a list of exp designs (different random seeds)
+            num_group, num_task = len(exp_design), len(exp_design[0])
+            assert all([(len(exp_design[0]) == len(exp_design[x])) for x in range(1, num_group)]), "Different number of tasks in some of groups in train data"
+
+            num_train, num_valid = [exp_design[0][x]['TrainIndices'].shape[0] for x in range(num_task)], [exp_design[0][x]['ValidationIndices'].shape[0] for x in range(num_task)]
+            y_depth = [len(exp_design[0][x]['Classes']) for x in range(num_task)]
+
+            if print_info:
+                print("Tasks : %d, Groups of training/valid : %d\n" %(num_task, num_group))
+                print("Train data : ", num_train, ", Validation data : ", num_valid)
+                print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+                print("Maximum label : ", y_depth, "\n")
+            return (num_task, num_group, num_train, num_valid, x_dim, y_dim, y_depth)
+        else:
+            raise ValueError("Given experiment design is in wrong format!")
+    else:
+        raise ValueError("Given experiment design is in wrong format!")
+
+def print_data_info(train_data, valid_data, test_data, print_info=False):
+    num_task = len(train_data)
+
+    num_train, num_valid, num_test = [train_data[x][0].shape[0] for x in range(num_task)], [valid_data[x][0].shape[0] for x in range(num_task)], [test_data[x][0].shape[0] for x in range(num_task)]
+    x_dim, y_dim = train_data[0][0].shape[1], 0
+    y_depth = [int(np.amax(x[1])+1) for x in train_data]
+    if print_info:
+        print("Tasks : %d\nTrain data : %d, Validation data : %d, Test data : %d" %(num_task, num_train, num_valid, num_test))
+        print("Input dim : %d, Label dim : %d" %(x_dim, y_dim))
+        print("Maximum label : ", y_depth, "\n")
+    return (num_task, num_train, num_valid, num_test, x_dim, y_dim, y_depth)
+
+
+def data_handler_for_experiment(categorized_train_data, categorized_test_data, experiment_design, img_shape=None):
+    ## Caution!
+    ## "experiment design" is a list of sub-tasks, NOT a list of L2M experiments (each L2M experiment == a list of sub-tasks)
+
+    ## each of train/validation/test data format:
+    ## data[task_index][x or y][instance_index] <- list of tuples of np 2D(x)/1D(y) array
+    train_data, validation_data, test_data = [], [], []
+    for task_design in experiment_design:
+        train_x_this_task, train_y_this_task = [], []
+        valid_x_this_task, valid_y_this_task = [], []
+        test_x_this_task, test_y_this_task = [], []
+
+        if 'Noise' in task_design.keys():
+            add_noise, noise_info = True, task_design['Noise']
+        else:
+            add_noise, noise_info = False, None
+
+        if 'ChannelSwap' in task_design.keys():
+            swap_channel, channel_swap_info = True, task_design['ChannelSwap']
+            assert (type(img_shape)==list), "Must give the shape of image to swap channels!"
+        else:
+            swap_channel, channel_swap_info = False, None
+
+        classes_for_this_task = task_design['Classes']
+        for class_cnt, (class_label) in enumerate(classes_for_this_task):
+            ## training data
+            indices_of_indices = np.nonzero(task_design['TrainIndices'][:,0]==class_label)
+            num_data = len(indices_of_indices[0])
+            if num_data < 1:
+                raise ValueError("Experiment design error: class description mismatch within one task!")
+            train_data_indices = task_design['TrainIndices'][indices_of_indices, 1]
+            train_x_this_task.append(np.array(categorized_train_data[class_label][train_data_indices,:][0]))
+            train_y_this_task.append(class_cnt*np.ones([num_data, 1], dtype=np.int32))
+
+            ## validation data
+            indices_of_indices = np.nonzero(task_design['ValidationIndices'][:,0]==class_label)
+            num_data = len(indices_of_indices[0])
+            if num_data < 1:
+                raise ValueError("Experiment design error: class description mismatch within one task!")
+            valid_data_indices = task_design['ValidationIndices'][indices_of_indices, 1]
+            valid_x_this_task.append(np.array(categorized_train_data[class_label][valid_data_indices,:][0]))
+            valid_y_this_task.append(class_cnt*np.ones([num_data, 1], dtype=np.int32))
+
+            ## test data
+            test_x_this_task.append(np.array(categorized_test_data[class_label]))
+            test_y_this_task.append(class_cnt*np.ones([test_x_this_task[-1].shape[0], 1], dtype=np.int32))
+
+        train_x_this_task, train_y_this_task = np.concatenate(train_x_this_task, axis=0), np.concatenate(train_y_this_task, axis=0).reshape(-1)
+        valid_x_this_task, valid_y_this_task = np.concatenate(valid_x_this_task, axis=0), np.concatenate(valid_y_this_task, axis=0).reshape(-1)
+        test_x_this_task, test_y_this_task = np.concatenate(test_x_this_task, axis=0), np.concatenate(test_y_this_task, axis=0).reshape(-1)
+
+        if add_noise:
+            train_x_this_task = np.clip(train_x_this_task + np.random.normal(loc=noise_info[0], scale=noise_info[1], size=train_x_this_task.shape), -0.5, 0.5)
+            valid_x_this_task = np.clip(valid_x_this_task + np.random.normal(loc=noise_info[0], scale=noise_info[1], size=valid_x_this_task.shape), -0.5, 0.5)
+            test_x_this_task = np.clip(test_x_this_task + np.random.normal(loc=noise_info[0], scale=noise_info[1], size=test_x_this_task.shape), -0.5, 0.5)
+
+        if swap_channel:
+            num_train, num_valid, num_test = train_x_this_task.shape[0], valid_x_this_task.shape[0], test_x_this_task.shape[0]
+            tmp_train_x, tmp_valid_x, tmp_test_x = train_x_this_task.reshape([num_train]+img_shape), valid_x_this_task.reshape([num_valid]+img_shape), test_x_this_task.reshape([num_test]+img_shape)
+
+            train_x_this_task = tmp_train_x[:,:,:,channel_swap_info].reshape([num_train, -1])
+            valid_x_this_task = tmp_valid_x[:,:,:,channel_swap_info].reshape([num_valid, -1])
+            test_x_this_task = tmp_test_x[:,:,:,channel_swap_info].reshape([num_test, -1])
+
+        train_data.append( (train_x_this_task, train_y_this_task) )
+        validation_data.append( (valid_x_this_task, valid_y_this_task) )
+        test_data.append( (test_x_this_task, test_y_this_task) )
+    return train_data, validation_data, test_data
+
+
+################################### Fashion MNIST data
+#### read/generate csv file for the information about experiment (classes and indices of images in each sub-task)
+def read_raw_fashion_mnist(data_path):
+    train_images_path = data_path+'/raw_data/train-images-idx3-ubyte.gz'
+    train_labels_path = data_path+'/raw_data/train-labels-idx1-ubyte.gz'
+    test_images_path = data_path+'/raw_data/t10k-images-idx3-ubyte.gz'
+    test_labels_path = data_path+'/raw_data/t10k-labels-idx1-ubyte.gz'
+    with gzip.open(train_labels_path, 'rb') as labelpath:
+        raw_train_labels = np.frombuffer(labelpath.read(), dtype=np.uint8, offset=8)
+    with gzip.open(train_images_path, 'rb') as imgpath:
+        raw_train_images = np.frombuffer(imgpath.read(), dtype=np.uint8, offset=16).reshape(len(raw_train_labels), 784).astype(dtype=np.float32)/255.0 - 0.5
+    with gzip.open(test_labels_path, 'rb') as labelpath:
+        raw_test_labels = np.frombuffer(labelpath.read(), dtype=np.uint8, offset=8)
+    with gzip.open(test_images_path, 'rb') as imgpath:
+        raw_test_images = np.frombuffer(imgpath.read(), dtype=np.uint8, offset=16).reshape(len(raw_test_labels), 784).astype(dtype=np.float32)/255.0 - 0.5
+    return (raw_train_images, raw_train_labels, raw_test_images, raw_test_labels)
+
+def fashion_mnist_data(experiment_file_base_name, valid_data_ratio_to_whole, num_train_group, num_tasks=5, data_percent=100, num_classes_per_task=2):
+    curr_path = os.getcwd()
+    if not ('Data' in os.listdir(curr_path)):
+        os.mkdir('./Data')
+
+    data_path = curr_path + '/Data/Fashion_MNIST'
+    raw_train_images, raw_train_labels, raw_test_images, raw_test_labels = read_raw_fashion_mnist(data_path)
+
+    ### make lists of data for each class
+    temp_categorized_train_data = data_class_split((raw_train_images, raw_train_labels), 10)
+    temp_categorized_test_data = data_class_split((raw_test_images, raw_test_labels), 10)
+
+    categorized_train_data = [np.array(A) for A in temp_categorized_train_data]
+    categorized_test_data = [np.array(A) for A in temp_categorized_test_data]
+    del raw_train_images, raw_train_labels, raw_test_images, raw_test_labels, temp_categorized_train_data, temp_categorized_test_data
+    num_train_data_each_class = [A.shape[0] for A in categorized_train_data]
+
+    try:
+        ### make code to read list of data indices for sub-tasks
+        print("\n\nRead the set of experiments using Fashion MNIST data!")
+        experiments_design = experiment_info_reader(experiment_file_base_name, data_path, num_train_group)
+    except:
+        ### design sub-tasks setting
+        print("\n\tNo experiment design exists!\nGenerate the set of experiments using Fashion MNIST data!")
+        experiments_design = experiment_designer(data_percent, num_tasks, num_train_group, valid_data_ratio_to_whole, num_train_data_each_class, num_classes_per_task=num_classes_per_task)
+
+        ### make code to save list of data indices for sub-tasks into file
+        experiment_info_writer(experiment_file_base_name, data_path, experiments_design)
+        print("\tSuccessfully generated and saved experiment set-up using Fashion MNIST data!\n\n")
+    return categorized_train_data, categorized_test_data, experiments_design
+
+
+
+################################### STL-10 data
+#### read/generate csv file for the information about experiment (classes and indices of images in each sub-task)
+def read_raw_stl10(data_path):
+    with open(data_path+'/raw_data/train_X.bin', 'rb') as fobj:
+        train_data_x_tmp = np.fromfile(fobj, dtype=np.uint8)
+        train_data_x = np.transpose(np.reshape(train_data_x_tmp, [-1, 3, 96, 96]), (0, 3, 2, 1)).astype(dtype=np.float32)/255.0 - 0.5
+        train_data_x = train_data_x.reshape([-1, 96*96*3])
+
+    with open(data_path+'/raw_data/train_y.bin', 'rb') as fobj:
+        train_data_y_tmp = np.fromfile(fobj, dtype=np.uint8)
+        train_data_y = train_data_y_tmp - 1
+
+    with open(data_path+'/raw_data/test_X.bin', 'rb') as fobj:
+        test_data_x_tmp = np.fromfile(fobj, dtype=np.uint8)
+        test_data_x = np.transpose(np.reshape(test_data_x_tmp, [-1, 3, 96, 96]), (0, 3, 2, 1)).astype(dtype=np.float32)/255.0 - 0.5
+        test_data_x = test_data_x.reshape([-1, 96*96*3])
+
+    with open(data_path+'/raw_data/test_y.bin', 'rb') as fobj:
+        test_data_y_tmp = np.fromfile(fobj, dtype=np.uint8)
+        test_data_y = test_data_y_tmp - 1
+    ## x : 2D matrix of float32 images (NHWC) [-0.5, 0.5], y : 1D array of uint8 labels
+    return (train_data_x, train_data_y, test_data_x, test_data_y)
+
+# num_train_max, num_valid_max, num_test_max, num_train_group, task_type, save_as_mat=False)
+def stl10_data(experiment_file_base_name, valid_data_ratio_to_whole, num_train_group, num_tasks=5, data_percent=1.0, num_classes_per_task=2, allowNoise=False, allowChannelSwap=False):
+    curr_path = os.getcwd()
+    if not ('Data' in os.listdir(curr_path)):
+        os.mkdir('./Data')
+
+    data_path = curr_path + '/Data/STL-10'
+    raw_train_images, raw_train_labels, raw_test_images, raw_test_labels = read_raw_stl10(data_path)
+
+    ### make lists of data for each class
+    temp_categorized_train_data = data_class_split((raw_train_images, raw_train_labels), 10)
+    temp_categorized_test_data = data_class_split((raw_test_images, raw_test_labels), 10)
+
+    categorized_train_data = [np.array(A) for A in temp_categorized_train_data]
+    categorized_test_data = [np.array(A) for A in temp_categorized_test_data]
+    del raw_train_images, raw_train_labels, raw_test_images, raw_test_labels, temp_categorized_train_data, temp_categorized_test_data
+    num_train_data_each_class = [A.shape[0] for A in categorized_train_data]
+
+    try:
+        ### make code to read list of data indices for sub-tasks
+        print("\n\nRead the set of experiments using STL-10 data!")
+        experiments_design = experiment_info_reader(experiment_file_base_name, data_path, num_train_group)
+        print("\tSuccessfully read experiment set-up using STL-10 data!\n\n")
+    except:
+        ### design sub-tasks setting
+        print("\n\tNo experiment design exists!\nGenerate the set of experiments using STL-10 data!")
+        experiments_design = experiment_designer(data_percent, num_tasks, num_train_group, valid_data_ratio_to_whole, num_train_data_each_class, num_classes_per_task=num_classes_per_task, allowNoise=allowNoise, allowChannelSwap=allowChannelSwap)
+
+        ### make code to save list of data indices for sub-tasks into file
+        experiment_info_writer(experiment_file_base_name, data_path, experiments_design)
+        print("\tSuccessfully generated and saved experiment set-up using STL-10 data!\n\n")
+    return categorized_train_data, categorized_test_data, experiments_design
+
+
+
+#################################### Miscellaneous
+
+#### save data in mat file
+def _data_save_to_mat(train_data, validation_data, test_data, num_train_group, num_task):
+    train_data_cell_x = np.zeros((num_train_group,), dtype=np.object)
+    train_data_cell_y = np.zeros((num_train_group,), dtype=np.object)
+    valid_data_cell_x = np.zeros((num_train_group,), dtype=np.object)
+    valid_data_cell_y = np.zeros((num_train_group,), dtype=np.object)
+    test_data_cell_x = np.zeros((num_task,), dtype=np.object)
+    test_data_cell_y = np.zeros((num_task,), dtype=np.object)
+
+    for group_cnt in range(num_train_group):
+        train_tmp_x, valid_tmp_x = np.zeros((num_task,), dtype=np.object), np.zeros((num_task,), dtype=np.object)
+        train_tmp_y, valid_tmp_y = np.zeros((num_task,), dtype=np.object), np.zeros((num_task,), dtype=np.object)
+        for task_cnt in range(num_task):
+            train_tmp_x[task_cnt] = train_data[group_cnt][task_cnt][0]
+            train_tmp_y[task_cnt] = train_data[group_cnt][task_cnt][1]
+            valid_tmp_x[task_cnt] = validation_data[group_cnt][task_cnt][0]
+            valid_tmp_y[task_cnt] = validation_data[group_cnt][task_cnt][1]
+        train_data_cell_x[group_cnt] = train_tmp_x
+        train_data_cell_y[group_cnt] = train_tmp_y
+        valid_data_cell_x[group_cnt] = valid_tmp_x
+        valid_data_cell_y[group_cnt] = valid_tmp_y
+
+    for task_cnt in range(num_task):
+        test_data_cell_x[task_cnt] = test_data[task_cnt][0]
+        test_data_cell_y[task_cnt] = test_data[task_cnt][1]
+
+    data_save_struct = {}
+    data_save_struct['train_data_x'] = train_data_cell_x
+    data_save_struct['train_data_y'] = train_data_cell_y
+    data_save_struct['valid_data_x'] = valid_data_cell_x
+    data_save_struct['valid_data_y'] = valid_data_cell_y
+    data_save_struct['test_data_x'] = test_data_cell_x
+    data_save_struct['test_data_y'] = test_data_cell_y
+    return data_save_struct
 
 
 if __name__ == '__main__':
 
-    ### CIFAR100 test
+    ### Sample code to handle CIFAR100 dataset
     '''
     data_type = 'cifar100'
     data_hyperpara = {}
@@ -850,6 +1325,9 @@ if __name__ == '__main__':
     cifar_data_print_info(train_data, validation_data, test_data)
     '''
 
-    ### Office-Home
-    tmp = officehome_data('temp.pkl', 0.6, 0.1, 0.3, 1, [128, 128, 3], save_as_mat=False)
-    num_task, num_group, num_train, num_valid, num_test, x_dim, y_dim, y_depth = officehome_data_print_info(tmp[0], tmp[1], tmp[2], print_info=True)
+    ### Sample code to handle Office-Home dataset
+    #tmp = officehome_data('temp.pkl', 0.6, 0.1, 0.3, 1, [128, 128, 3], save_as_mat=False)
+    #num_task, num_group, num_train, num_valid, num_test, x_dim, y_dim, y_depth = officehome_data_print_info(tmp[0], tmp[1], tmp[2], print_info=True)
+
+    #print(os.listdir('./Data/STL-10/'))
+    #with open('./Data/STL-10/train_X.bin', 'rb') as fobj:
